@@ -1,178 +1,164 @@
-import sqlite3
+import json
 import os
+import threading
+import asyncio
 from flask import Flask, render_template_string
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import threading
 
-# ==============================
-# Configuración
-# ==============================
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "6436352209:AAHH8IWy246pACneF3NPFhdJcsjkokmfOlU"
-DB_FILE = "inventario.db"
-APP_URL = os.environ.get("APP_URL", "https://telegram-inventario-mq1c.onrender.com")  # Cambia por tu URL de Render
+APP_URL = "https://telegram-inventario-mq1c.onrender.com"  # Render URL
+DATA_FILE = "inventario.json"
+AUTHORIZED_USERS = [1886047632]  # Agrega más IDs aquí
 
-# ==============================
-# Base de datos SQLite
-# ==============================
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS inventario (
-            producto TEXT PRIMARY KEY,
-            stock INTEGER
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS movimientos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            producto TEXT,
-            cantidad INTEGER,
-            accion TEXT,
-            persona TEXT,
-            telegram_user TEXT,
-            user_id INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
+# ---------------- DATA ----------------
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w") as f:
+        json.dump({}, f)
 
-def agregar_producto(producto, cantidad, persona, telegram_user, user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+with open(DATA_FILE, "r") as f:
+    try:
+        inventario = json.load(f)
+    except json.JSONDecodeError:
+        inventario = {}
 
-    c.execute("SELECT stock FROM inventario WHERE producto=?", (producto,))
-    row = c.fetchone()
-    if row:
-        nuevo_stock = row[0] + cantidad
-        c.execute("UPDATE inventario SET stock=? WHERE producto=?", (nuevo_stock, producto))
-    else:
-        nuevo_stock = cantidad
-        c.execute("INSERT INTO inventario (producto, stock) VALUES (?, ?)", (producto, cantidad))
+def guardar_inventario():
+    with open(DATA_FILE, "w") as f:
+        json.dump(inventario, f, indent=4)
 
-    c.execute("""
-        INSERT INTO movimientos (producto, cantidad, accion, persona, telegram_user, user_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (producto, cantidad, "agregar", persona, telegram_user, user_id))
+# ---------------- PERMISOS ----------------
+def autorizado(update: Update) -> bool:
+    """Verifica si el usuario está autorizado"""
+    return update.effective_user.id in AUTHORIZED_USERS
 
-    conn.commit()
-    conn.close()
-    return nuevo_stock
-
-def vender_producto(producto, cantidad, persona, telegram_user, user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    c.execute("SELECT stock FROM inventario WHERE producto=?", (producto,))
-    row = c.fetchone()
-    if not row or row[0] < cantidad:
-        conn.close()
-        return None
-
-    nuevo_stock = row[0] - cantidad
-    c.execute("UPDATE inventario SET stock=? WHERE producto=?", (nuevo_stock, producto))
-
-    c.execute("""
-        INSERT INTO movimientos (producto, cantidad, accion, persona, telegram_user, user_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (producto, cantidad, "vender", persona, telegram_user, user_id))
-
-    conn.commit()
-    conn.close()
-    return nuevo_stock
-
-def obtener_inventario():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT producto, stock FROM inventario")
-    datos = c.fetchall()
-    conn.close()
-    return datos
-
-# ==============================
-# BOT Telegram
-# ==============================
+# ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bienvenido al Bot de Inventario.\nUsa /agregar, /vender, /inventario")
+    if not autorizado(update):
+        await update.message.reply_text("❌ No estás autorizado para usar este bot.")
+        return
+    await update.message.reply_text("🤖 Bienvenido al Bot de Inventario!\nUsa /agregar, /vender o /inventario.")
+
+async def miid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el ID del usuario"""
+    await update.message.reply_text(f"🆔 Tu ID es: {update.effective_user.id}")
 
 async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        producto = context.args[0].lower()
-        cantidad = int(context.args[1])
-        persona_input = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+    if not autorizado(update):
+        await update.message.reply_text("❌ No estás autorizado para usar este bot.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /agregar <producto> <cantidad>")
+        return
+    producto = context.args[0].lower()
+    cantidad = int(context.args[1])
+    usuario = update.effective_user.username or update.effective_user.first_name
 
-        user = update.effective_user
-        persona_telegram = user.username if user.username else user.first_name
-        persona = persona_input if persona_input else persona_telegram
+    if producto not in inventario:
+        inventario[producto] = {"cantidad": 0, "ultima_accion": ""}
 
-        nuevo_stock = agregar_producto(producto, cantidad, persona, persona_telegram, user.id)
-        await update.message.reply_text(f"✅ {cantidad} {producto} agregado.\n📦 Stock actual: {nuevo_stock}")
-    except:
-        await update.message.reply_text("❌ Uso correcto: /agregar producto cantidad persona")
+    inventario[producto]["cantidad"] += cantidad
+    inventario[producto]["ultima_accion"] = f"Añadido por {usuario}"
+
+    guardar_inventario()
+    await update.message.reply_text(f"✅ {cantidad} unidades de {producto} añadidas por {usuario}.")
 
 async def vender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        producto = context.args[0].lower()
-        cantidad = int(context.args[1])
-        persona_input = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+    if not autorizado(update):
+        await update.message.reply_text("❌ No estás autorizado para usar este bot.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /vender <producto> <cantidad>")
+        return
+    producto = context.args[0].lower()
+    cantidad = int(context.args[1])
+    usuario = update.effective_user.username or update.effective_user.first_name
 
-        user = update.effective_user
-        persona_telegram = user.username if user.username else user.first_name
-        persona = persona_input if persona_input else persona_telegram
+    if producto not in inventario or inventario[producto]["cantidad"] < cantidad:
+        await update.message.reply_text("❌ No hay suficiente stock.")
+        return
 
-        nuevo_stock = vender_producto(producto, cantidad, persona, persona_telegram, user.id)
-        if nuevo_stock is None:
-            await update.message.reply_text("⚠️ No hay suficiente stock o el producto no existe.")
-            return
+    inventario[producto]["cantidad"] -= cantidad
+    inventario[producto]["ultima_accion"] = f"Vendido por {usuario}"
 
-        await update.message.reply_text(f"💸 {cantidad} {producto} vendido.\n📦 Stock actual: {nuevo_stock}")
-    except:
-        await update.message.reply_text("❌ Uso correcto: /vender producto cantidad persona")
+    guardar_inventario()
+    await update.message.reply_text(f"🛒 {usuario} vendió {cantidad} unidades de {producto}.")
 
 async def inventario_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🌐 Consulta el inventario aquí: {APP_URL}")
+    if not autorizado(update):
+        await update.message.reply_text("❌ No estás autorizado para usar este bot.")
+        return
+    await update.message.reply_text(f"📦 Inventario disponible aquí:\n{APP_URL}/inventario")
 
-# ==============================
-# Servidor Flask para ver inventario en HTML
-# ==============================
+# ---------------- FLASK APP ----------------
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    datos = obtener_inventario()
-    html = """
-    <h1>📦 Inventario Actual</h1>
-    <table border="1" cellpadding="5">
-      <tr><th>Producto</th><th>Stock</th></tr>
-      {% for p, s in datos %}
-      <tr><td>{{p}}</td><td>{{s}}</td></tr>
-      {% endfor %}
-    </table>
+    return "✅ Bot de Inventario corriendo en Render"
+
+@app.route("/inventario")
+def ver_inventario():
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Inventario</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+        <div class="container mt-5">
+            <h1 class="mb-4 text-center">📦 Inventario</h1>
+            <table class="table table-striped table-bordered shadow">
+                <thead class="table-dark">
+                    <tr>
+                        <th>Producto</th>
+                        <th>Cantidad</th>
+                        <th>Última acción</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for producto, datos in inventario.items() %}
+                    <tr>
+                        <td>{{ producto }}</td>
+                        <td>{{ datos['cantidad'] }}</td>
+                        <td>{{ datos['ultima_accion'] }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
     """
-    return render_template_string(html, datos=datos)
+    return render_template_string(html_template, inventario=inventario)
 
-# ==============================
-# Main
-# ==============================
-def main():
-    init_db()
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+async def webhook(update: Update):
+    telegram_app.update_queue.put_nowait(update)
+    return "OK"
 
-    # Iniciar BOT en un hilo aparte
-    def run_bot():
-        app_tg = Application.builder().token(BOT_TOKEN).build()
-        app_tg.add_handler(CommandHandler("start", start))
-        app_tg.add_handler(CommandHandler("agregar", agregar))
-        app_tg.add_handler(CommandHandler("vender", vender))
-        app_tg.add_handler(CommandHandler("inventario", inventario_cmd))
-        print("🤖 Bot de inventario en marcha...")
-        app_tg.run_polling()
+# ---------------- RUN BOT ----------------
+async def run_bot():
+    global telegram_app
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-    threading.Thread(target=run_bot).start()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("miid", miid))
+    telegram_app.add_handler(CommandHandler("agregar", agregar))
+    telegram_app.add_handler(CommandHandler("vender", vender))
+    telegram_app.add_handler(CommandHandler("inventario", inventario_cmd))
 
-    # Iniciar servidor Flask
-    print("🌐 Servidor web corriendo en Render")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Registrar webhook
+    await telegram_app.bot.set_webhook(url=f"{APP_URL}/webhook/{BOT_TOKEN}")
+
+    print("🤖 Bot escuchando con Webhook...")
+    await telegram_app.start()
+
+def start_bot():
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=start_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
