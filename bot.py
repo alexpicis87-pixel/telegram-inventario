@@ -10,7 +10,7 @@ import threading
 # ==============================
 BOT_TOKEN = "6436352209:AAHH8IWy246pACneF3NPFhdJcsjkokmfOlU"
 DB_FILE = "inventario.db"
-APP_URL = os.environ.get("APP_URL", "https://tu-app.onrender.com")  # Cambia por tu URL de Render
+APP_URL = os.environ.get("APP_URL", "https://telegram-inventario-mq1c.onrender.com")  # Cambia por tu URL de Render
 
 # ==============================
 # Base de datos SQLite
